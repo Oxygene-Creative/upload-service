@@ -1,13 +1,15 @@
-import httpx
-import sys
-import os
 import asyncio
-import re
+import httpx
+import json
 import logging
+import os
+import re
+import sys
 import tempfile
+import time
 from datetime import datetime
-from pathlib import Path
 from difflib import get_close_matches
+from pathlib import Path
 
 from upload_client import upload_recording, trigger_ingestion
 
@@ -83,19 +85,158 @@ CONVERSION_FAILURE = []
 UPLOAD_SUCCESS = []
 UPLOAD_FAILURE = []
 
-SKIP_TS_CONVERSION = os.environ.get("SKIP_TS_CONVERSION", "false").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
 
-SKIP_INGESTION = os.environ.get("SKIP_INGESTION", "false").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+SKIP_TS_CONVERSION = _env_flag("SKIP_TS_CONVERSION", default=False)
+SKIP_INGESTION = _env_flag("SKIP_INGESTION", default=False)
+RECURSIVE_SCAN = _env_flag("RECURSIVE_SCAN", default=True)
+WAIT_FOR_COMPLETION = _env_flag("WAIT_FOR_COMPLETION", default=True)
+
+COMPLETION_POLL_SECONDS = float(
+    os.environ.get("COMPLETION_POLL_SECONDS", "30"))
+COMPLETION_TIMEOUT_SECONDS = float(
+    os.environ.get("COMPLETION_TIMEOUT_SECONDS", "7200"))
+
+ELASTIC_NODE = os.environ.get(
+    "ELASTIC_NODE") or os.environ.get("ELASTIC_CLOUD_URL")
+ELASTIC_API_KEY = os.environ.get("ELASTIC_API_KEY")
+ELASTIC_INDEX_PATTERN = os.environ.get("ELASTIC_INDEX_PATTERN", "tv_*")
+
+MANIFEST_PATH = os.environ.get(
+    "MANIFEST_PATH",
+    str(Path(LOCAL_RECORDING_DIR) / ".upload_manifest.json"),
+)
+
+ALLOWED_EXTENSIONS = {".ts", ".mp4"}
+TARGET_DIRECTORIES = os.environ.get(
+    "TARGET_DIRECTORIES") or os.environ.get("TARGET_DIRS")
+
+
+def _parse_target_dirs(root_dir: Path) -> list[Path]:
+    if not TARGET_DIRECTORIES:
+        return [root_dir]
+
+    dirs: list[Path] = []
+    for raw in TARGET_DIRECTORIES.split(","):
+        candidate = raw.strip()
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        if not path.is_absolute():
+            path = root_dir / path
+        if not path.exists() or not path.is_dir():
+            logger.warning("Skipping invalid target dir: %s", path)
+            continue
+        dirs.append(path)
+
+    return dirs
+
+
+def _load_manifest(path: str) -> dict:
+    try:
+        manifest_path = Path(path)
+        if not manifest_path.exists():
+            return {}
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        logger.warning("Failed to read manifest %s", path, exc_info=True)
+        return {}
+
+
+def _save_manifest(path: str, manifest: dict) -> None:
+    try:
+        manifest_path = Path(path)
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        with manifest_path.open("w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, indent=2, sort_keys=True)
+    except Exception:
+        logger.warning("Failed to write manifest %s", path, exc_info=True)
+
+
+def _update_manifest(manifest: dict, file_path: Path, status: str, reason: str | None = None) -> None:
+    manifest[str(file_path)] = {
+        "status": status,
+        "reason": reason,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def _iter_recording_files(root_dir: Path) -> list[Path]:
+    if RECURSIVE_SCAN:
+        files = [
+            path
+            for path in root_dir.rglob("*")
+            if path.is_file() and path.suffix.lower() in ALLOWED_EXTENSIONS
+        ]
+    else:
+        files = [
+            path
+            for path in root_dir.glob("*")
+            if path.is_file() and path.suffix.lower() in ALLOWED_EXTENSIONS
+        ]
+    return sorted(files)
+
+
+def _list_recording_dirs(files: list[Path]) -> list[str]:
+    dirs = sorted({str(path.parent) for path in files})
+    return dirs
+
+
+async def _wait_for_es_completion(stream_id: str, timestamp: str) -> bool:
+    if not WAIT_FOR_COMPLETION:
+        return True
+    if not ELASTIC_NODE or not ELASTIC_API_KEY:
+        logger.warning(
+            "Skipping ES completion check (missing ELASTIC_NODE or ELASTIC_API_KEY)")
+        return True
+
+    deadline = time.monotonic() + COMPLETION_TIMEOUT_SECONDS
+    headers = {
+        "Authorization": f"ApiKey {ELASTIC_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    query = {
+        "size": 1,
+        "sort": [{"timestamp": {"order": "desc"}}],
+        "query": {
+            "bool": {
+                "filter": [
+                    {"term": {"status.complete": True}},
+                    {"term": {"timestamp": timestamp}},
+                ],
+                "should": [
+                    {"term": {"stream_id": stream_id}},
+                    {"term": {"stream_id.keyword": stream_id}},
+                ],
+                "minimum_should_match": 1,
+            }
+        },
+    }
+
+    search_url = f"{ELASTIC_NODE.rstrip('/')}/{ELASTIC_INDEX_PATTERN}/_search"
+    async with httpx.AsyncClient(timeout=30, verify=False) as client:
+        while time.monotonic() < deadline:
+            try:
+                response = await client.post(search_url, headers=headers, json=query)
+                response.raise_for_status()
+                payload = response.json()
+                hits = payload.get("hits", {}).get("hits", [])
+                if hits:
+                    return True
+            except Exception:
+                logger.warning("ES completion check failed", exc_info=True)
+
+            await asyncio.sleep(COMPLETION_POLL_SECONDS)
+
+    return False
 
 
 def record_conversion_result(file_name: str, success: bool,
@@ -508,10 +649,16 @@ def find_stream_match(streams: list, tv_station_name: str, filename: str):
     )
 
 
-async def process_and_upload(streams: list, recording_path: str):
+async def process_and_upload(streams: list, recording_path: str) -> dict:
     """Process a single recording: convert when possible, match, upload."""
     original_path = Path(recording_path)
     current_path = recording_path
+
+    result = {
+        "file": str(original_path),
+        "status": "skipped",
+        "reason": None,
+    }
 
     logger.info(f"--- Starting processing for file: {original_path.name} ---")
 
@@ -533,7 +680,8 @@ async def process_and_upload(streams: list, recording_path: str):
                 "Skipping file %s: invalid filename format.",
                 filename,
             )
-            return
+            result["reason"] = "invalid filename format"
+            return result
 
         # Extract details
         tv_station_name = (
@@ -554,7 +702,8 @@ async def process_and_upload(streams: list, recording_path: str):
                 filename,
                 tv_station_name,
             )
-            return
+            result["reason"] = f"no stream match for {tv_station_name}"
+            return result
         stream_id = matched_stream["id"]
         stream_name = matched_stream["tv_stream_name"]
         logger.info(
@@ -572,7 +721,9 @@ async def process_and_upload(streams: list, recording_path: str):
                     "no media streams.",
                     original_path.name,
                 )
-                return
+                result["status"] = "failed"
+                result["reason"] = "conversion failed"
+                return result
 
             current_path = converted_path
             logger.info(
@@ -595,8 +746,11 @@ async def process_and_upload(streams: list, recording_path: str):
                     "Skipping ingestion for %s due to SKIP_INGESTION flag.",
                     stream_name,
                 )
+                result["status"] = "uploaded"
+                result["reason"] = "ingestion skipped"
             else:
                 await trigger_ingestion(stream_id, stream_name, full_timestamp)
+                result["status"] = "uploaded"
             record_upload_result(
                 original_path.name,
                 True,
@@ -632,6 +786,14 @@ async def process_and_upload(streams: list, recording_path: str):
             )
 
             logger.info("✅ Upload and cleanup complete.")
+
+            if not SKIP_INGESTION:
+                completed = await _wait_for_es_completion(stream_id, full_timestamp)
+                if completed:
+                    result["status"] = "completed"
+                else:
+                    result["status"] = "timeout"
+                    result["reason"] = "ES completion timeout"
         else:
             failure_reason = None
             if upload_result:
@@ -651,15 +813,20 @@ async def process_and_upload(streams: list, recording_path: str):
                 "⚠️ Upload failed for %s. All files remain for manual retry.",
                 original_path.name,
             )
-
+            result["status"] = "failed"
+            result["reason"] = failure_reason
     except Exception:
         logger.critical(
             "Critical failure while processing file: %s.",
             original_path.name,
             exc_info=True,
         )
+        result["status"] = "failed"
+        result["reason"] = "unexpected exception"
 
     logger.info("--- Finished processing for file: %s ---", original_path.name)
+
+    return result
 
 
 async def upload_single_recording(recording_name: str) -> None:
@@ -701,24 +868,50 @@ async def main():
         logger.error("Could not retrieve TV streams. Exiting script.")
         return
 
-    # Scan local directory for TS recordings
-    all_files = list(Path(LOCAL_RECORDING_DIR).glob('*'))
-    recording_files = [f for f in all_files if f.is_file()
-                       and f.suffix.lower() == '.ts']
-
-    if not recording_files:
-        logger.info(f"No .ts files found in directory: {LOCAL_RECORDING_DIR}")
+    root_dir = Path(LOCAL_RECORDING_DIR)
+    target_dirs = _parse_target_dirs(root_dir)
+    if not target_dirs:
+        logger.error("No valid target directories found. Nothing to process.")
         return
 
-    # Create a list of tasks for parallel processing
-    tasks = []
-    for file_path in recording_files:
-        tasks.append(process_and_upload(streams, str(file_path)))
+    recording_files: list[Path] = []
+    for target_dir in target_dirs:
+        recording_files.extend(_iter_recording_files(target_dir))
 
-    # Wait for all processing tasks to complete
-    if tasks:
-        logger.info(f"Starting to process {len(tasks)} recording file(s)...")
-        await asyncio.gather(*tasks)
+    recording_files = sorted({path.resolve() for path in recording_files})
+    recording_dirs = _list_recording_dirs(recording_files)
+
+    if recording_dirs:
+        logger.info("Recording directories discovered (%d):",
+                    len(recording_dirs))
+        for directory in recording_dirs:
+            logger.info("- %s", directory)
+
+    if not recording_files:
+        logger.info(
+            "No .ts/.mp4 files found in directory: %s",
+            LOCAL_RECORDING_DIR,
+        )
+        return
+
+    manifest = _load_manifest(MANIFEST_PATH)
+
+    logger.info("Starting to process %d recording file(s)...",
+                len(recording_files))
+    for file_path in recording_files:
+        manifest_entry = manifest.get(str(file_path))
+        if manifest_entry and manifest_entry.get("status") in {"completed", "uploaded"}:
+            logger.info("Skipping already processed file: %s", file_path.name)
+            continue
+
+        result = await process_and_upload(streams, str(file_path))
+        _update_manifest(
+            manifest,
+            file_path,
+            result.get("status", "unknown"),
+            result.get("reason"),
+        )
+        _save_manifest(MANIFEST_PATH, manifest)
 
     if CONVERSION_SUCCESS:
         logger.info(
