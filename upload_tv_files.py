@@ -55,7 +55,6 @@ try:
         )
 
     required_vars = {
-        "LOCAL_RECORDING_DIR": LOCAL_RECORDING_DIR,
         "GRAPHQL_URI": GRAPHQL_URI,
         "GRAPHQL_API_KEY": GRAPHQL_API_KEY,
         "MEDIASERVER_URI": MEDIASERVER_URI,
@@ -70,7 +69,7 @@ try:
             f"{missing_str}"
         )
 
-    if not Path(LOCAL_RECORDING_DIR).is_dir():
+    if LOCAL_RECORDING_DIR and not Path(LOCAL_RECORDING_DIR).is_dir():
         raise FileNotFoundError(
             "LOCAL_RECORDING_DIR not found or is not a directory: "
             f"{LOCAL_RECORDING_DIR}")
@@ -108,19 +107,20 @@ ELASTIC_NODE = os.environ.get(
 ELASTIC_API_KEY = os.environ.get("ELASTIC_API_KEY")
 ELASTIC_INDEX_PATTERN = os.environ.get("ELASTIC_INDEX_PATTERN", "tv_*")
 
-MANIFEST_PATH = os.environ.get(
-    "MANIFEST_PATH",
-    str(Path(LOCAL_RECORDING_DIR) / ".upload_manifest.json"),
-)
+MANIFEST_PATH = os.environ.get("MANIFEST_PATH")
 
 ALLOWED_EXTENSIONS = {".ts", ".mp4"}
 TARGET_DIRECTORIES = os.environ.get(
     "TARGET_DIRECTORIES") or os.environ.get("TARGET_DIRS")
+BASE_RECORDING_DIR = os.environ.get("BASE_RECORDING_DIR")
+DAILY_RECORDING_DATE = os.environ.get("DAILY_RECORDING_DATE")
+DAILY_RECORDING_DATE_FORMAT = os.environ.get(
+    "DAILY_RECORDING_DATE_FORMAT", "%Y-%m-%d")
 
 
-def _parse_target_dirs(root_dir: Path) -> list[Path]:
+def _parse_target_dirs(root_dir: Path | None) -> list[Path]:
     if not TARGET_DIRECTORIES:
-        return [root_dir]
+        return []
 
     dirs: list[Path] = []
     for raw in TARGET_DIRECTORIES.split(","):
@@ -129,6 +129,12 @@ def _parse_target_dirs(root_dir: Path) -> list[Path]:
             continue
         path = Path(candidate).expanduser()
         if not path.is_absolute():
+            if root_dir is None:
+                logger.error(
+                    "Relative TARGET_DIRECTORIES entry requires LOCAL_RECORDING_DIR: %s",
+                    candidate,
+                )
+                continue
             path = root_dir / path
         if not path.exists() or not path.is_dir():
             logger.warning("Skipping invalid target dir: %s", path)
@@ -136,6 +142,24 @@ def _parse_target_dirs(root_dir: Path) -> list[Path]:
         dirs.append(path)
 
     return dirs
+
+
+def _get_daily_recording_dir() -> Path | None:
+    if not BASE_RECORDING_DIR:
+        return None
+
+    base_dir = Path(BASE_RECORDING_DIR).expanduser()
+    if not base_dir.exists() or not base_dir.is_dir():
+        logger.error(
+            "BASE_RECORDING_DIR not found or is not a directory: %s", base_dir)
+        return None
+
+    if DAILY_RECORDING_DATE:
+        date_part = DAILY_RECORDING_DATE.strip()
+    else:
+        date_part = datetime.now().strftime(DAILY_RECORDING_DATE_FORMAT)
+
+    return base_dir / date_part
 
 
 def _load_manifest(path: str) -> dict:
@@ -868,10 +892,18 @@ async def main():
         logger.error("Could not retrieve TV streams. Exiting script.")
         return
 
-    root_dir = Path(LOCAL_RECORDING_DIR)
+    root_dir = Path(LOCAL_RECORDING_DIR) if LOCAL_RECORDING_DIR else None
     target_dirs = _parse_target_dirs(root_dir)
+
     if not target_dirs:
-        logger.error("No valid target directories found. Nothing to process.")
+        daily_dir = _get_daily_recording_dir()
+        if daily_dir:
+            target_dirs = [daily_dir]
+
+    if not target_dirs:
+        logger.error(
+            "No valid TARGET_DIRECTORIES or daily recording dir found. Nothing to process."
+        )
         return
 
     recording_files: list[Path] = []
@@ -888,13 +920,16 @@ async def main():
             logger.info("- %s", directory)
 
     if not recording_files:
-        logger.info(
-            "No .ts/.mp4 files found in directory: %s",
-            LOCAL_RECORDING_DIR,
-        )
+        logger.info("No .ts/.mp4 files found in target directories.")
         return
 
-    manifest = _load_manifest(MANIFEST_PATH)
+    if not MANIFEST_PATH:
+        manifest_base = target_dirs[0]
+        manifest_path = manifest_base / ".upload_manifest.json"
+    else:
+        manifest_path = Path(MANIFEST_PATH).expanduser()
+
+    manifest = _load_manifest(str(manifest_path))
 
     logger.info("Starting to process %d recording file(s)...",
                 len(recording_files))
@@ -911,7 +946,7 @@ async def main():
             result.get("status", "unknown"),
             result.get("reason"),
         )
-        _save_manifest(MANIFEST_PATH, manifest)
+        _save_manifest(str(manifest_path), manifest)
 
     if CONVERSION_SUCCESS:
         logger.info(
