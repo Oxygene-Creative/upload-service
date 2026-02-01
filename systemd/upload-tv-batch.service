@@ -1,0 +1,17 @@
+[Unit]
+Description=Upload Service nightly batch
+After=network-online.target
+Wants=network-online.target
+Wants=mount-synology.service
+After=mount-synology.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/peter.njuguna@ad.oxygenehq.com/dev/monitor-workspace/upload-service
+EnvironmentFile=-/home/peter.njuguna@ad.oxygenehq.com/dev/monitor-workspace/upload-service/.env.upload
+Environment=DAILY_ONLY=true
+Environment=TARGET_DIRECTORIES=
+ExecStart=/usr/bin/python3 /home/peter.njuguna@ad.oxygenehq.com/dev/monitor-workspace/upload-service/upload_tv_files.py
+
+[Install]
+WantedBy=multi-user.target

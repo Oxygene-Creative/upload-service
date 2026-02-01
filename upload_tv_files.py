@@ -96,6 +96,7 @@ SKIP_TS_CONVERSION = _env_flag("SKIP_TS_CONVERSION", default=False)
 SKIP_INGESTION = _env_flag("SKIP_INGESTION", default=False)
 RECURSIVE_SCAN = _env_flag("RECURSIVE_SCAN", default=True)
 WAIT_FOR_COMPLETION = _env_flag("WAIT_FOR_COMPLETION", default=True)
+DAILY_ONLY = _env_flag("DAILY_ONLY", default=False)
 
 COMPLETION_POLL_SECONDS = float(
     os.environ.get("COMPLETION_POLL_SECONDS", "30"))
@@ -893,12 +894,21 @@ async def main():
         return
 
     root_dir = Path(LOCAL_RECORDING_DIR) if LOCAL_RECORDING_DIR else None
-    target_dirs = _parse_target_dirs(root_dir)
+    target_dirs: list[Path] = []
 
-    if not target_dirs:
+    if not DAILY_ONLY:
+        target_dirs = _parse_target_dirs(root_dir)
+
+    if DAILY_ONLY or not target_dirs:
         daily_dir = _get_daily_recording_dir()
         if daily_dir:
             target_dirs = [daily_dir]
+        elif DAILY_ONLY:
+            logger.error(
+                "DAILY_ONLY is enabled but daily recording dir is missing. "
+                "Check BASE_RECORDING_DIR/DAILY_RECORDING_DATE."
+            )
+            return
 
     if not target_dirs:
         logger.error(

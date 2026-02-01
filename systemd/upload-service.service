@@ -5,7 +5,7 @@ Requires=docker.service
 
 [Service]
 Type=simple
-WorkingDirectory=/home/peter.njuguna@ad.oxygenehq.com/dev/monitor-workspace/upload-service
+WorkingDirectory=/home/peter/dev/upload-service-main
 ExecStart=/usr/bin/docker compose up --remove-orphans
 ExecStop=/usr/bin/docker compose down
 Restart=always
