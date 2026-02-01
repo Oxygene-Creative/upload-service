@@ -1,0 +1,21 @@
+services:
+  upload-service:
+    build: .
+    image: o2-upload-service:local
+    container_name: o2-upload-service
+    env_file:
+      - .env.upload
+    environment:
+      UPLOAD_SERVICE_PORT: 9001
+      LOG_LEVEL: DEBUG
+    ports:
+      - "9001:9001"
+    command: >-
+      sh -c "uvicorn upload_service_api:app --host 0.0.0.0 --port ${UPLOAD_SERVICE_PORT:-9001} --log-level debug"
+    restart: unless-stopped
+    networks:
+      - o2-scheduler_backnet
+
+networks:
+  o2-scheduler_backnet:
+    external: true

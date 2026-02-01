@@ -1,0 +1,15 @@
+[Unit]
+Description=O2 Upload Service API
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/peter.njuguna@ad.oxygenehq.com/dev/monitor-workspace/upload-service
+ExecStart=/usr/bin/docker compose up --remove-orphans
+ExecStop=/usr/bin/docker compose down
+Restart=always
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
