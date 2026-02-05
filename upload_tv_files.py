@@ -692,8 +692,8 @@ async def process_and_upload(streams: list, recording_path: str) -> dict:
         filename = original_path.stem
         pattern = (
             r"[-_]"
-            r"(?:Signet\s+(?P<station_signet>[A-Za-z0-9\s]+)"
-            r"|PANG-(?P<station_pang>[A-Za-z0-9\s]+))"
+            r"(?:Signet\s+(?P<station_signet>[A-Za-z0-9\s-]+)"
+            r"|PANG-(?P<station_pang>[A-Za-z0-9\s-]+))"
             r"[-_]"
             r"(?P<date>\d{4}-\d{2}-\d{2})"
             r"[-_](?P<time>\d{2}[-_]\d{2})[-_]?"
@@ -713,7 +713,11 @@ async def process_and_upload(streams: list, recording_path: str) -> dict:
             match.group("station_signet")
             or match.group("station_pang")
             or ""
-        ).replace("Signet", "").strip()
+        ).replace("Signet", "").replace("-", " ").strip()
+        station_aliases = {
+            "KTN HOME": "KTN",
+        }
+        tv_station_name = station_aliases.get(tv_station_name, tv_station_name)
         date = match.group("date")
         timestamp = match.group("time").replace("-", ":")
         full_timestamp = f"{date}T{timestamp}:00"
